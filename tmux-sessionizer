@@ -1,48 +1,223 @@
 #!/usr/bin/env bash
+
+################################################################################
+# TMUX / Project Switcher Script
+#
+# Features:
+#   1. Lists projects (directories) and active TMUX sessions via either:
+#      - Rofi (if $ROFI_RETV is set)
+#      - fzf (otherwise)
+#   2. Attaches or switches to a TMUX session if it exists; creates one otherwise.
+#   3. Auto-generates a list of directories by depth.
+################################################################################
+
+##
+# Store final user selection in these global variables:
+#   selected_path  -> The chosen project directory
+#   selected_name  -> The session name (basename of selected_path), or a direct session name
+##
+selected_path=""
+selected_name=""
+
+################################################################################
+# 1) HELPER FUNCTIONS
+################################################################################
+
+##
+# Safely switch/attach to an existing TMUX session.
+#   - If outside TMUX, run `tmux attach-session -t NAME`.
+#   - If inside TMUX, run `tmux switch-client -t NAME`.
+#   - If called from Rofi, kill Rofi and launch command in Alacritty.
+##
 switch_to() {
-    if [[ -z $TMUX ]]; then
-        tmux attach-session -t $1
-    else
-        tmux switch-client -t $1
-    fi
+	local session_name="$1"
+	local cmd
+
+	if [[ -z "$TMUX" ]]; then
+		# Outside TMUX, attach
+		cmd="tmux attach-session -t $session_name"
+	else
+		# Inside TMUX, switch
+		cmd="tmux switch-client -t $session_name"
+	fi
+
+	if [[ -n "$ROFI_RETV" ]]; then
+		# From Rofi, kill Rofi and launch in Alacritty
+		killall rofi 2>/dev/null
+		alacritty -e $cmd
+	else
+		eval "$cmd"
+	fi
 }
 
+##
+# Check if a TMUX session with the given name exists.
+##
 has_session() {
-    tmux list-sessions | grep -q "^$1:"
+	local session_name="$1"
+	tmux list-sessions -F "#{session_name}" 2>/dev/null | grep -qx "$session_name"
 }
 
-hydrate() {
-    if [ -f $2/.tmux-sessionizer ]; then
-        tmux send-keys -t $1 "source $2/.tmux-sessionizer" c-M
-    elif [ -f $HOME/.tmux-sessionizer ]; then
-        tmux send-keys -t $1 "source $HOME/.tmux-sessionizer" c-M
-    fi
+##
+# Create a new TMUX session with some default windows/commands.
+##
+create_session() {
+	tmux new-session -d -s "$selected_name" -c "$selected_path" -n code
+	tmux send-keys -t "$selected_name" "nvim" C-m
+	tmux new-window -d -t "$selected_name" -c "$selected_path" -n bash
+	tmux new-window -d -t "$selected_name" -c "$selected_path" -n server
 }
 
-if [[ $# -eq 1 ]]; then
-    selected=$1
-else
-    # If someone wants to make this extensible, i'll accept
-    # PR
-    selected=$(find ~/ ~/personal ~/personal/dev/env/.config -mindepth 1 -maxdepth 1 -type d | fzf)
-fi
+##
+# Generate a list of directories based on specified depths, skipping certain paths.
+# Returns the final list via stdout.
+##
+build_directories() {
+	declare -A dirs
+	# Adjust these to your preference
+	dirs[0]="$HOME/.config/scripts"
+	dirs[1]="$HOME/build/"
+	dirs[4]="$HOME/programming/ $HOME/projects/ $HOME/Documents/programming/"
 
-if [[ -z $selected ]]; then
-    exit 0
-fi
+	local total_dirs=""
 
-selected_name=$(basename "$selected" | tr . _)
-tmux_running=$(pgrep tmux)
+	for depth in $(echo "${!dirs[@]}" | tr ' ' '\n' | sort -n); do
+		IFS=' ' read -r -a paths <<<"${dirs[$depth]}"
+		# Minimum depth is 0 if depth=0, else 1 (avoid including root if not intended)
+		local min_depth=$((depth == 0 ? 0 : 1))
 
-if [[ -z $TMUX ]] && [[ -z $tmux_running ]]; then
-    tmux new-session -s $selected_name -c $selected
-    hydrate $selected_name $selected
-    exit 0
-fi
+		for p in "${paths[@]}"; do
+			# Collect directories at the specified depth
+			local found
+			found=$(find "$p" \
+				-mindepth "$min_depth" \
+				-maxdepth "$depth" \
+				-type d \
+				! -path "*/node_modules*" \
+				! -path "*/__pycache__*" \
+				! -path "*/.venv*" \
+				! -path "*/.git*" \
+				-printf "%p/\n" 2>/dev/null)
 
-if ! has_session $selected_name; then
-    tmux new-session -ds $selected_name -c $selected
-    hydrate $selected_name $selected
-fi
+			# Merge into total_dirs
+			if [[ -z "$total_dirs" ]]; then
+				total_dirs="$found"
+			else
+				total_dirs=$(echo -e "${total_dirs}\n${found}")
+			fi
+		done
+	done
 
-switch_to $selected_name
+	# Sort + remove duplicates
+	echo -e "$total_dirs" | sort -u
+}
+
+##
+# Return a list of currently active TMUX sessions (one per line).
+##
+list_active_sessions() {
+	tmux list-sessions -F "#{session_name}" 2>/dev/null
+}
+
+##
+# Master selection function:
+#   1. Build the master list (active sessions + directories).
+#   2. Display via Rofi/fzf depending on environment.
+#   3. Save result into global $selected_path or $selected_name.
+##
+select_target() {
+	local all_dirs
+	local sessions
+	local combined
+
+	sessions="$(list_active_sessions)"
+	all_dirs="$(build_directories)"
+
+	# If launched by rofi (ROFI_RETV=0 means "show list")
+	if [[ -n "$ROFI_RETV" && "$ROFI_RETV" -eq 0 ]]; then
+		combined=$(echo -e "${sessions}\n${all_dirs}")
+		echo "$combined"
+		exit 0
+	fi
+
+	# If rofi is in "user selected" mode (ROFI_RETV=1), or using CLI/fzf
+	if [[ -n "$ROFI_RETV" && "$ROFI_RETV" -eq 1 ]]; then
+		# For Rofi, the chosen item is passed as arguments ($@)
+		# e.g. rofi might pass "projects/something"
+		local input="$*"
+		if [[ -n "$input" ]]; then
+			if echo "$sessions " | grep -qx "$input"; then
+				# The user selected a session name
+				selected_name="$input"
+				selected_path=""
+			else
+				# The user selected a directory
+				selected_path="$input"
+				selected_name=$(basename "$input" | tr '.' '_')
+			fi
+		fi
+	else
+		# No Rofi, use fzf
+		# If a session name was passed as arg1, or both a name and path were passed
+		if [[ $# -ge 1 ]]; then
+			selected_name="$1"
+			# If user also provided a path
+			if [[ $# -ge 2 ]]; then
+				selected_path="$2"
+				return
+			fi
+
+			# If only a session name was provided, check if it exists
+			if has_session "$selected_name"; then
+				return
+			else
+				# Otherwise, pick a directory for that new session
+				selected_path="$(echo -e "$all_dirs" | fzf --cycle)"
+			fi
+		else
+			# No arguments provided, so pick from fzf
+			selected_path="$(echo -e "$all_dirs" | fzf --cycle)"
+			selected_name=$(basename "$selected_path" | tr '.' '_')
+		fi
+	fi
+}
+
+################################################################################
+# 2) MAIN LOGIC
+################################################################################
+
+main() {
+	# 1. Determine user selection
+	select_target "$@"
+
+	# If user canceled or didn't pick anything
+	if [[ -z "$selected_name" && -z "$selected_path" ]]; then
+		exit 0
+	fi
+
+	# If the user specifically chose an existing TMUX session
+	if [[ -n "$selected_name" && -z "$selected_path" ]]; then
+		switch_to "$selected_name"
+		exit 0
+	fi
+
+	# If we have a path but no explicit session name, generate one
+	if [[ -z "$selected_name" && -n "$selected_path" ]]; then
+		selected_name="$(basename "$selected_path" | tr '.' '_')"
+	fi
+
+	# 2. Check if we need to create a new session or just switch to it
+	local tmux_running
+	tmux_running="$(pgrep tmux)"
+
+	# If tmux is not running, or the session doesn't exist, create a new one
+	if { [[ -z "$TMUX" && -z "$tmux_running" ]] || ! has_session "$selected_name"; }; then
+		create_session
+	fi
+
+	# 3. Switch to (or attach) that session
+	switch_to "$selected_name"
+}
+
+# Script entrypoint
+main "$@"
