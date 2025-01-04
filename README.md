@@ -1,12 +1,7 @@
-## tmux sessionizer
-its a script that does everything awesome at all times
+# Tmux Session Switcher
 
-## Usage
-```bash
-tmux-sessionizer [<partial name of session>]
-```
+Although it is a clone from ThePrimaAgen, I have made it much more powerful and
+easily configurable.
 
-if you execute tmux-sessionizer without any parameters it will assume FZF and
-try to fuzzy find over a set of directories.
-
-TODO: waiting on that directory list to be dynamic :) (go a head make pr if you want)
+I hope it will be useful for you as well. If you've got any suggestions or PRs,
+feel free to open an issue or send a pull request.
