@@ -1,7 +1,5 @@
 # Tmux Session Switcher
 
-## Description
-
 Although it is a clone from ThePrimaAgen, I have made it much more powerful and
 easily configurable.
 
